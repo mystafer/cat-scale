@@ -6,7 +6,7 @@ def store_event(event, dynamodb=None):
         dynamodb = boto3.resource('dynamodb')
 
     table = dynamodb.Table('cat_scale_event')
-    response = table.put_item(
+    table.put_item(
         Item={
             'sample_date': event['date_utc'],
             'sample_time': event['time_utc'],

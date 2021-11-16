@@ -4,59 +4,10 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import pytz as tz
 
-PREVIOUS_TIME_INTERVAL = 24 * 60 * 60 * 1000  # 24 hours
+MILLIS_24_HOURS = 24 * 60 * 60 * 1000  # 24 hours
+PREVIOUS_TIME_INTERVAL = 7 * MILLIS_24_HOURS  # 7 days
 NUM_PREVIOUS_EVENTS = 3
-OUTLIER_THRESHOLD = Decimal(1.5)
-
-def timestamp_to_keys(timestamp):
-    """ convert a timestamp to partition and sort keys """
-    dt = datetime.utcfromtimestamp(int(timestamp/1000))
-
-    partition_key = dt.strftime("%Y.%m.%d")
-    sort_key = dt.strftime("%H:%M:%S:") + str(timestamp%1000).zfill(3)
-
-    return (partition_key, sort_key)
-
-def query_log(keys, dynamodb=None):
-    """ query DynamoDB log table for entries matching keys """
-    if not dynamodb:
-        dynamodb = boto3.resource('dynamodb')
-
-    table = dynamodb.Table('cat_scale_event')
-    response = table.query(
-        KeyConditionExpression=Key('sample_date').eq(keys['pk'])
-            & Key('sample_time').between(*keys['sk'])
-    )
-    return response['Items']
-
-def fetch_last_events_for_ts(ts, dynamodb=None):
-    """ fetch all relevant events for a timestamp """
-
-    # calculate start timestamp from end
-    start_ts = ts - PREVIOUS_TIME_INTERVAL
-    end_ts = ts
-
-    # compute keys to use for queries
-    # may need two queries if over two days
-    start_keys = timestamp_to_keys(start_ts)
-    end_keys = timestamp_to_keys(end_ts)
-    query_keys = []
-    if (start_keys[0] == end_keys[0]):
-        query_keys.append({ 'pk': end_keys[0], 'sk': [start_keys[1], end_keys[1]]})
-    else:
-        query_keys.append({ 'pk': start_keys[0], 'sk': [start_keys[1], '23:59:59.9999']})
-        query_keys.append({ 'pk': end_keys[0], 'sk': ['00:00:00.0000', end_keys[1]]})
-
-    # execute queries and concat results
-    all_entries = []
-    for query_key in query_keys:
-        all_entries += query_log(query_key, dynamodb)
-
-    # sort all entries by timestamp
-    all_entries.sort(key=lambda x: x['event_data']['timestamp'], reverse=True)
-
-    return all_entries
-
+OUTLIER_THRESHOLD = Decimal(0.55)
 
 def query_settings_for_cats(dynamodb=None):
     """ query DynamoDB config table for cat entries """
@@ -70,40 +21,116 @@ def query_settings_for_cats(dynamodb=None):
     return response['Items']
 
 
+def timestamp_to_keys(timestamp):
+    """ convert a timestamp to partition and sort keys """
+    dt = datetime.utcfromtimestamp(int(timestamp/1000))
+
+    partition_key = dt.strftime("%Y.%m.%d")
+    sort_key = dt.strftime("%H:%M:%S:") + str(timestamp%1000).zfill(3)
+
+    return (partition_key, sort_key)
+
+def query_events(keys, dynamodb=None):
+    """ query DynamoDB log table for entries matching keys """
+    if not dynamodb:
+        dynamodb = boto3.resource('dynamodb')
+
+    table = dynamodb.Table('cat_scale_event')
+    if 'sk' in keys:
+        response = table.query(
+            KeyConditionExpression=Key('sample_date').eq(keys['pk'])
+                & Key('sample_time').between(*keys['sk'])
+        )
+    else:
+        response = table.query(
+            KeyConditionExpression=Key('sample_date').eq(keys['pk'])
+        )
+
+    return response['Items']
+
+
+def fetch_cat_events_for_ts(cats, timestamp, dynamodb=None):
+    """ fetch all relevant events for a timestamp """
+
+    event_to_update = None
+
+    # loop over days in reverse from starting timestamp up to limit interval
+    start_ts = int(timestamp)
+    end_ts = int(timestamp - PREVIOUS_TIME_INTERVAL)
+    increment = int(-MILLIS_24_HOURS)
+    for ts in range(start_ts, end_ts, increment):
+        ts_keys = timestamp_to_keys(ts)
+
+        # start by querying from start of day till the end key
+        if (ts == timestamp):
+            query_keys = { 'pk': ts_keys[0], 'sk': ['00:00:00.000', ts_keys[1]]}
+
+        # subsequent iterations query the whole dah
+        else:
+            query_keys = { 'pk': ts_keys[0] }
+
+        print(f"Query keys: {query_keys}")
+
+        # fetch events matching query keys
+        events = query_events(query_keys, dynamodb)
+
+        # find the event to update if it is not defined
+        if (not event_to_update):
+            event_to_update = [e for e in events if e['event_data']['timestamp'] == ts][:1]
+
+            # make sure events were found before proceeding
+            if (len(event_to_update) == 0):
+                return None
+            event_to_update = event_to_update[0]    
+
+        # loop over cats and find events relevant to them
+        for cat in cats:
+            cat_events = [ e for e in events if 'cat' in e and e['cat'] == cat['name'] ]
+
+            if 'last_events' in cat:
+                cat['last_events'] += cat_events
+            else:
+                cat['last_events'] = cat_events
+
+        # determine if requisite number of events for each cat have been found
+        # break out of loop and stop going backwards if this is the case
+        smallest_num_events = min(len(cat['last_events']) for cat in cats)
+        if (smallest_num_events >= NUM_PREVIOUS_EVENTS):
+            break
+
+    return event_to_update
+
+
 def assign_cat_to_event(ts, dynamodb=None):
 
     # load settings of defined cats
     cats = query_settings_for_cats(dynamodb)
 
+    # fetch event to update and relevant events for cats
+    event_to_update = fetch_cat_events_for_ts(cats, ts, dynamodb)
+
+    # make sure events were found before proceeding
+    if not event_to_update:
+        return None
+
     # determine last weight for each cat to use
     for cat in cats:
-        defined_weights = cat['defined_weights']
+
+        # look at owner defined weights first for each cat
+        # look for most recent weight defined that is before our queried timestamp
+        defined_weights=[w for w in cat['defined_weights'] if w['timestamp'] <= ts]
         defined_weights.sort(key=lambda x: x['timestamp'], reverse=True)
         cat['configured_weight'] = defined_weights[0]['weight']
         cat['configured_weight_ts'] = defined_weights[0]['timestamp']
 
-    # fetch all the events in the last 24 hours
-    events = fetch_last_events_for_ts(ts, dynamodb)
-    # print(events)
-
-    # locate event in question
-    event_to_update = [e for e in events if e['event_data']['timestamp'] == ts][:1]
-    
-    # make sure events were found before proceeding
-    if (len(event_to_update) == 0):
-        return None
-    event_to_update = event_to_update[0]
-
-    event_weight = event_to_update['event_data']['weight']
-
-    # loop over cats and find events relevant to them to determine weight to use
-    for cat in cats:
+        # sort cat entries by timestamp then keep only the top previous events
+        last_cat_events = cat['last_events']
+        last_cat_events.sort(key=lambda x: x['event_data']['timestamp'], reverse=True)
         cat_events = [ 
-            e for e in events 
-            if 'cat' in e and e['cat'] == cat['name'] and e['event_data']['timestamp'] > cat['configured_weight_ts']
+                e for e in last_cat_events if e['event_data']['timestamp'] > cat['configured_weight_ts']
             ][:NUM_PREVIOUS_EVENTS]
-        cat['last_events'] = cat_events
-
+        
+        # use average of last event weights if possible, else use configured weight from owner
         if (cat_events):
             cat['last_weight'] = Decimal(sum(item['event_data']['weight'] for item in cat_events) / len(cat_events))            
         else:
@@ -117,6 +144,7 @@ def assign_cat_to_event(ts, dynamodb=None):
     high_outlier = max_weight + OUTLIER_THRESHOLD
 
     # check if event is an outlier
+    event_weight = event_to_update['event_data']['weight']
     if event_weight < low_outlier:
         event_to_update['cat'] = 'OUTLIER_LOW'
         return event_to_update
@@ -164,19 +192,3 @@ def assign_cat_to_event(ts, dynamodb=None):
     # event is between cats - still an outlier
     event_to_update['cat'] = 'OUTLIER'
     return event_to_update
-
-if __name__ == '__main__':
-
-    dynamodb = boto3.resource('dynamodb')
-
-    # ts = 1636940685633  # None
-
-    ts = 1636978760263  # Mocha
-
-    # ts = 1636999546290  # Latte
-
-    # ts = 1637005825872 # Outlier
-
-    event = assign_cat_to_event(ts)
-
-    print(event)

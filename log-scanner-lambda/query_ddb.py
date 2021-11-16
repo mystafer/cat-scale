@@ -41,8 +41,8 @@ def fetch_log_entries_for_ts(ts, dynamodb=None):
     if (start_keys[0] == end_keys[0]):
         query_keys.append({ 'pk': end_keys[0], 'sk': [start_keys[1], end_keys[1]]})
     else:
-        query_keys.append({ 'pk': start_keys[0], 'sk': [start_keys[1], '23:59:59.9999']})
-        query_keys.append({ 'pk': end_keys[0], 'sk': ['00:00:00.0000', end_keys[1]]})
+        query_keys.append({ 'pk': start_keys[0], 'sk': [start_keys[1], '23:59:59.999']})
+        query_keys.append({ 'pk': end_keys[0], 'sk': ['00:00:00.000', end_keys[1]]})
 
     # execute queries and concat results
     all_entries = []
@@ -115,13 +115,3 @@ def create_event_for_ts(ts, dynamodb=None):
                 'elapsed_sec': time_elapsed,
                 'weight': max_weight,
             }
-
-
-if __name__ == '__main__':
-    ts = 1636940685633
-
-    # ts = 1636940942318
-
-    event = create_event_for_ts(ts)
-
-    print(event)
