@@ -99,19 +99,19 @@ def create_event_for_ts(ts, dynamodb=None):
         max_weight_entry = max(entries, key=lambda x: x['device_data']['weight'])
         max_weight = max_weight_entry['device_data']['weight']
 
-        # calculate EST time data
+        # calculate local time data
         dt = datetime.utcfromtimestamp(int(end_ts/1000)).replace(tzinfo=timezone.utc)
-        dt_est = dt.astimezone(tz.timezone('America/New_York'))
-        date_est = dt_est.strftime("%Y.%m.%d")
-        time_est = dt_est.strftime("%H:%M:%S:") + str(end_ts%1000).zfill(3) + '0'
+        dt_local = dt.astimezone(tz.timezone('America/New_York'))
+        date_local = dt_local.strftime("%Y.%m.%d")
+        time_local = dt_local.strftime("%H:%M:%S:") + str(end_ts%1000).zfill(3)
 
         # return event data for timestamp
         return { 
                 'timestamp': end_ts,
                 'date_utc': end_entry['sample_date'],
                 'time_utc': end_entry['sample_time'],
-                'date_est': date_est,
-                'time_est': time_est,
+                'date_local': date_local,
+                'time_local': time_local,
                 'elapsed_sec': time_elapsed,
                 'weight': max_weight,
             }
