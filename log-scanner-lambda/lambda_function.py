@@ -39,10 +39,12 @@ def lambda_handler(event, context):
                 
                 # create an event to store for the zero record
                 scale_event = create_event_for_ts(timestamp, dynamodb)
-                print(scale_event)
 
                 # store the event in dynamodb
-                store_event(scale_event, dynamodb)
-
+                if (scale_event):
+                    print(scale_event)
+                    store_event(scale_event, dynamodb)
+                else:
+                    print("Event ignored...")
 
     return 'Successfully processed {} records.'.format(len(event['Records']))
